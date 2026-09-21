@@ -41,6 +41,11 @@ al menos un job terminó por completo. Se revisa en el loop principal antes
 de mostrar el prompt*/
 static volatile sig_atomic_t hay_jobs_terminados = 0;
 
+//banderas y variables para pmon
+static volatile sig_atomic_t pmon_alarma = 0;
+static volatile sig_atomic_t pmon_interrumpido = 0;
+
+
 void mostrar_prompt(void){
     char directorio[PATH_MAX];
 
@@ -158,7 +163,7 @@ void listar_jobs(void){
     int alguno = 0;
     for(int i = 0; i <MAX_JOBS; i++){
         if(jobs_bg[i].en_uso && !jobs_bg[i].terminado){
-            printf("[%d] Ejecutando\t%s\n", jobs_bg[i].id, jobs_bg->comando);
+            printf("[%d] Ejecutando\t%s\n", jobs_bg[i].id, jobs_bg[i].comando);
             alguno = 1;
         }
     }
@@ -167,6 +172,192 @@ void listar_jobs(void){
     }
 
     restaurar_mascara(&anterior);
+}
+
+//manejadores para pmon
+
+static void manejador_alarma_pmon(int señal){
+    (void)señal;
+    pmon_alarma = 1;
+}
+
+static void manejador_sigint_pmon(int señal){
+    (void)señal;
+    pmon_interrumpido = 1;
+}
+
+//estructura para almacenar mediciones cpu
+typedef struct{
+    pid_t pid;
+    unsigned long long utime;
+    unsigned long long stime;
+}MedicionCPU;
+
+//f auxiliar para leer estadísticas
+static int infoProceso(pid_t pid, char *estado_out, double *cpu_out, long *rss_out, MedicionCPU *historial, int *num_historial, double delta_tiempo){
+    char ruta[256];
+
+    //lectura
+    snprintf(ruta, sizeof(ruta), "/proc/%d/stat", (int)pid);
+    FILE *fstat = fopen(ruta, "r");
+    if(!fstat) return -1;
+
+    char estado_char = '?';
+    unsigned long long utime = 0, stime = 0;
+
+    char buffer_stat[1024];
+    if (fgets(buffer_stat, sizeof(buffer_stat), fstat) != NULL){
+        char *p_cierrerpar = strrchr(buffer_stat, ')');
+        if(p_cierrerpar != NULL){
+            if(sscanf(p_cierrerpar + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &estado_char, &utime, &stime) < 3){
+                estado_char = '?';
+            }
+        }
+    }
+    fclose(fstat);
+    *estado_out = estado_char;
+
+        //cálculo de cpu
+
+    unsigned long long utime_prev = 0, stime_prev = 0;
+    int encontrado = 0;
+    for(int i = 0; i < *num_historial; i++){
+        if(historial[i].pid == pid){
+            utime_prev = historial[i].utime;
+            stime_prev = historial[i].stime;
+            historial[i].utime =utime;
+            historial[i].stime = stime;
+            encontrado = 1;
+            break;
+        }
+    }
+    if (!encontrado && *num_historial < 128) {
+        historial[*num_historial].pid = pid;
+        historial[*num_historial].utime = utime;
+        historial[*num_historial].stime = stime;
+        (*num_historial)++;
+        utime_prev = utime;
+        stime_prev = stime;
+    }
+
+    unsigned long long diff_ticks = (utime + stime) - (utime_prev + stime_prev);
+    double clk_tck = (double)sysconf(_SC_CLK_TCK);
+    if (clk_tck <= 0) clk_tck = 100.0;
+
+    if (delta_tiempo > 0.0) {
+        *cpu_out = ((double)diff_ticks / clk_tck / delta_tiempo) * 100.0;
+        if (*cpu_out < 0.0) *cpu_out = 0.0;
+    } else {
+        *cpu_out = 0.0;
+    }
+
+    snprintf(ruta, sizeof(ruta), "/proc/%d/status", (int)pid);
+    FILE *fstatus = fopen(ruta, "r");
+    long rss = 0;
+    if (fstatus) {
+        char linea_status[256];
+        while (fgets(linea_status, sizeof(linea_status), fstatus)) {
+            if (strncmp(linea_status, "VmRSS:", 6) == 0) {
+                sscanf(linea_status + 6, "%ld", &rss);
+                break;
+            }
+        }
+        fclose(fstatus);
+    }
+    *rss_out = rss;
+
+    return 0;
+
+}
+
+void comando_pmon(int segundos_intervalo){
+    if(segundos_intervalo <= 0) segundos_intervalo = 2;
+
+    struct sigaction sa_alarma, sa_int_ant, sa_alarma_ant;
+
+    memset(&sa_alarma, 0, sizeof(sa_alarma));
+    sa_alarma.sa_handler = manejador_alarma_pmon;
+    sigemptyset(&sa_alarma.sa_mask);
+    sa_alarma.sa_flags = 0;
+    sigaction(SIGALRM, &sa_alarma, &sa_alarma_ant);
+
+    struct sigaction sa_int;
+    memset(&sa_int, 0, sizeof(sa_int));
+    sa_int.sa_handler = manejador_sigint_pmon;
+    sigemptyset(&sa_int.sa_mask);
+    sa_int.sa_flags = 0;
+    sigaction(SIGINT, &sa_int, &sa_int_ant);
+
+    pmon_interrumpido = 0;
+    pmon_alarma = 1;
+
+    MedicionCPU historial[128];
+    int num_historial = 0;
+
+    printf("\033[2J\033[H");
+
+    alarm(segundos_intervalo);
+
+    while (!pmon_interrumpido) {
+        if (pmon_alarma) {
+            pmon_alarma = 0;
+
+        
+            printf("\033[H\033[J");
+            printf("PID\tCOMANDO\t\t\tESTADO\t\t%%CPU(aprox)\tRSS (KB)\n");
+            printf("------------------------------------------------------------------------\n");
+
+            sigset_t anterior;
+            bloquear_sigchld(&anterior);
+
+            int activos = 0;
+            for (int i = 0; i < MAX_JOBS; i++) {
+                if (jobs_bg[i].en_uso && !jobs_bg[i].terminado) {
+                    // Monitoreamos todos los pids que componen el job
+                    for (int p = 0; p < jobs_bg[i].n_pids; p++) {
+                        pid_t target_pid = jobs_bg[i].pids[p];
+                        char estado_letra;
+                        double cpu = 0.0;
+                        long rss = 0;
+
+                        // Si el proceso sigue vivo, leemos su info
+                        if (infoProceso(target_pid, &estado_letra, &cpu, &rss, 
+                                              historial, &num_historial, (double)segundos_intervalo) == 0) {
+                    
+                            const char *estado_txt = "desconocido";
+                            if (estado_letra == 'R') estado_txt = "ejecutando";
+                            else if (estado_letra == 'S') estado_txt = "durmiendo";
+                            else if (estado_letra == 'Z') estado_txt = "zombie";
+                            else if (estado_letra == 'T') estado_txt = "detenido";
+
+                            //imprime fila
+                            printf("%d\t%-20s\t%-12s\t%.1f\t\t%ld\n", 
+                                   (int)target_pid, jobs_bg[i].comando, estado_txt, cpu, rss);
+                            activos++;
+                        }
+                    }
+                }
+            }
+            if (activos == 0) {
+                printf("No hay jobs activos en background para monitorear.\n");
+            }
+
+            restaurar_mascara(&anterior);
+            printf("\n[Presione Ctrl+C para salir de pmon]\n");
+            fflush(stdout);
+
+            alarm(segundos_intervalo);
+        }
+
+        pause();
+    }
+
+    alarm(0); //cancelar alarma pendiente
+    sigaction(SIGALRM, &sa_alarma_ant, NULL);
+    sigaction(SIGINT, &sa_int_ant, NULL);
+
+    printf("\n");
+            
 }
 
 
@@ -519,6 +710,15 @@ int main(void){
         }
 
         //pmon == depende de la seccion 3
+        if(strcmp(argv[0], "pmon") == 0){
+            int segundos = 2; 
+            if(argv[1] != NULL){
+                segundos = atoi(argv[1]);
+            }
+            comando_pmon(segundos);
+            free(argv);
+            continue;
+        }
 
         int n_comandos;
         Comando *comandos = construir_pipeline(argv, &n_comandos);
