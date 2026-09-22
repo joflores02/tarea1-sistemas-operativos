@@ -9,6 +9,11 @@
 #include <signal.h>
 #include <errno.h>
 
+#ifdef USE_READLINE
+#include <readline/readline.h>
+#include <readline/history.h>
+#endif
+
 typedef struct {    //se define la estructura Comando
     char **argv;
     char *infile;
@@ -19,6 +24,7 @@ typedef struct {    //se define la estructura Comando
 
 #define MAX_JOBS  64
 #define MAX_PIPELINE  32
+#define MAX_FILAS_PMON 256
 
 typedef struct 
 {
@@ -270,6 +276,26 @@ static int infoProceso(pid_t pid, char *estado_out, double *cpu_out, long *rss_o
 
 }
 
+//Para el bonus, se usa una fila ya calculada de la tabla de pmon, para poder ordenarlas por %CPU antes de imprimir, 
+//en vez de imprimir a medida que se leen
+typedef struct {
+    pid_t pid;
+    char comando[256];
+    char estado_txt[16];
+    double cpu;
+    long rss;
+} FilaPmon;
+
+//Para el bonus, se ordena de forma descendente por %CPU, donde qsort deja primero al proceso
+// que más CPU esta usando
+static int comparar_cpu_desc(const void *a, const void *b){
+    const FilaPmon *fa = a;
+    const FilaPmon *fb = b;
+    if (fa->cpu > fb->cpu) return -1;
+    if (fa->cpu < fb->cpu) return 1;
+    return 0;
+}
+
 void comando_pmon(int segundos_intervalo){
     if(segundos_intervalo <= 0) segundos_intervalo = 2;
 
@@ -309,8 +335,12 @@ void comando_pmon(int segundos_intervalo){
 
             sigset_t anterior;
             bloquear_sigchld(&anterior);
+            
+            //para el bonus en vez de imprimir cada fila al vuelo, se juntan primero
+            // todas en un arreglo para poder ordenarlas por %CPU 
+            static FilaPmon filas[MAX_FILAS_PMON];
+            int num_filas = 0;
 
-            int activos = 0;
             for (int i = 0; i < MAX_JOBS; i++) {
                 if (jobs_bg[i].en_uso && !jobs_bg[i].terminado) {
                     // Monitoreamos todos los pids que componen el job
@@ -330,19 +360,42 @@ void comando_pmon(int segundos_intervalo){
                             else if (estado_letra == 'Z') estado_txt = "zombie";
                             else if (estado_letra == 'T') estado_txt = "detenido";
 
-                            //imprime fila
-                            printf("%d\t%-20s\t%-12s\t%.1f\t\t%ld\n", 
-                                   (int)target_pid, jobs_bg[i].comando, estado_txt, cpu, rss);
-                            activos++;
+                            filas[num_filas].pid = target_pid;
+                            strncpy(filas[num_filas].comando, jobs_bg[i].comando, sizeof(filas[num_filas].comando) - 1);
+                            filas[num_filas].comando[sizeof(filas[num_filas].comando) - 1] = '\0';
+                            strncpy(filas[num_filas].estado_txt, estado_txt, sizeof(filas[num_filas].estado_txt) - 1);
+                            filas[num_filas].estado_txt[sizeof(filas[num_filas].estado_txt) - 1] = '\0';
+                            filas[num_filas].cpu = cpu;
+                            filas[num_filas].rss = rss;
+                            num_filas++;
                         }
                     }
                 }
             }
-            if (activos == 0) {
-                printf("No hay jobs activos en background para monitorear.\n");
-            }
 
             restaurar_mascara(&anterior);
+            
+            //el orden por CPU descendiente
+            qsort(filas, num_filas, sizeof(FilaPmon), comparar_cpu_desc);
+
+            if (num_filas == 0) {
+                printf("No hay jobs activos en background para monitorear.\n");
+            }
+            else{
+                for (int f = 0; f < num_filas; f++) {
+                    if (f == 0 && filas[f].cpu > 0.0) {
+                        // [BONUS] se resalta (color + marca) el proceso con mayor %CPU
+                        printf("\033[1;33m%d\t%-20s\t%-12s\t%.1f\t\t%ld\t<== mayor uso\033[0m\n",
+                               (int)filas[f].pid, filas[f].comando, filas[f].estado_txt,
+                               filas[f].cpu, filas[f].rss);
+                    } else {
+                        printf("%d\t%-20s\t%-12s\t%.1f\t\t%ld\n",
+                               (int)filas[f].pid, filas[f].comando, filas[f].estado_txt,
+                               filas[f].cpu, filas[f].rss);
+                    }
+                }
+            }
+
             printf("\n[Presione Ctrl+C para salir de pmon]\n");
             fflush(stdout);
 
@@ -410,7 +463,7 @@ char **separar_tokens(char *linea){
         return NULL;
     }
 
-    char *token = strtok(linea, " \t"); //strtok recorre la línea buscando tokens.
+    char *token = strtok(linea, " \t\r\n"); //strtok recorre la línea buscando tokens.
 
     while(token != NULL){
         if(cantidad >= capacidad-1){
@@ -429,7 +482,7 @@ char **separar_tokens(char *linea){
         tokens[cantidad] = token;
         cantidad++;
 
-        token = strtok(NULL, " \t");
+        token = strtok(NULL, " \t\r\n");
     }
 
     tokens[cantidad] = NULL;
@@ -564,7 +617,7 @@ int ejecutar_pipeline(Comando *comandos, int n, int background, const char *text
             }
 
             execvp(comandos[i].argv[0], comandos[i].argv);
-            perror("execvp");
+            fprintf(stderr, "mishell: %s: %s\n", comandos[i].argv[0], strerror(errno));
             _exit(EXIT_FAILURE);
         }
 
@@ -606,6 +659,32 @@ int ejecutar_pipeline(Comando *comandos, int n, int background, const char *text
     return 0;
 }
 
+static char *leer_linea_entrada(const char *prompt){
+#ifdef USE_READLINE
+    return readline(prompt);
+#else
+    printf("%s", prompt);
+    fflush(stdout);
+
+    size_t capacidad = 4096;
+    char *buffer = malloc(capacidad);
+    if(buffer == NULL){
+        perror("malloc");
+        return NULL;
+    }
+
+    if(fgets(buffer, (int)capacidad, stdin) == NULL){
+        free(buffer);
+        return NULL; //EOF, igual que readline()
+    }
+
+    size_t len = strlen(buffer);
+    if(len > 0 && buffer[len - 1] == '\n'){
+        buffer[len - 1] = '\0';
+    }
+    return buffer;
+#endif
+}
 
 int main(void){
     char linea[4096]; //lugar en el que se guardará la línea que ingrese el usuario
@@ -615,6 +694,12 @@ int main(void){
     mediante SIGCHLD*/
     instalar_manejadores_shell();
 
+#ifdef USE_READLINE
+    rl_catch_signals = 0;
+    rl_catch_sigwinch = 0;
+    using_history();
+    rl_variable_bind("enable-bracketed-paste", "off");
+#endif
 
     //el ciclo a continuación se repetirá continuamente, debido a que es algo 
     //que debe realizar la shell en todo momento que esté activa.
@@ -623,21 +708,33 @@ int main(void){
         revisar_jobs_terminados();
 
 
-        mostrar_prompt();
-        
-        if(fgets(linea, sizeof(linea), stdin) == NULL){
+        //para el bonus, el historial navegable con flechas, se arma el prompt como un string
+        //porque readline() lo necesita como argumento para dibujarlo y luego dejar la línea editable
+        char directorio[PATH_MAX];
+        char prompt[PATH_MAX + 32];
+        if (getcwd(directorio, sizeof(directorio)) == NULL) {
+            perror("getcwd");
+            strcpy(directorio, "?");
+        }
+        snprintf(prompt, sizeof(prompt), "mishell:%s$ ", directorio);
 
+        char *entrada = leer_linea_entrada(prompt);
 
-            if(ferror(stdin) && errno == EINTR){
-                clearerr(stdin);
-                continue;
-            }
+        if (entrada == NULL) {
+            // Ctrl+D (EOF)
             printf("\n");
             break;
         }
+        
+        if (entrada[0] != '\0') {
+#ifdef USE_READLINE
+            add_history(entrada);
+#endif
+        }
 
-        linea[strcspn(linea, "\n")] = '\0';
-
+        strncpy(linea, entrada, sizeof(linea) - 1);
+        linea[sizeof(linea) - 1] = '\0';
+        free(entrada);
 
         char linea_para_mostrar[4096];
         strncpy(linea_para_mostrar, linea, sizeof(linea_para_mostrar) -1);
