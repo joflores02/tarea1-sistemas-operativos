@@ -454,18 +454,23 @@ void limpiar_texto_comando(char *texto){
 
 char **separar_tokens(char *linea){
     int capacidad = 10; //numero de punteros que se pueden guardar al inicio en el arreglo de tokens
-    int cantidad = 0; //numero de tokens encontrados
+    int cantidad = 0;   //numero de tokens encontrados
 
     char **tokens = malloc(capacidad*sizeof(char *));
-    
+
     if(tokens == NULL){
         perror("malloc");
         return NULL;
     }
 
-    char *token = strtok(linea, " \t\r\n"); //strtok recorre la línea buscando tokens.
+    /*Tokenizador propio con soporte de comillas simples y dobles, donde lo que va entre las
+    comillas forma parte de un mismo token (con sus espacios) y las comillas se quitan.
+    Los tokens se reescriben sobre la misma memoria de la linea*/
+    char *lee = linea;
+    while(*lee != '\0'){
+        while(*lee == ' ' || *lee == '\t' || *lee == '\r' || *lee == '\n') lee++;
+        if(*lee == '\0') break;
 
-    while(token != NULL){
         if(cantidad >= capacidad-1){
             capacidad = capacidad*2;
             char **tokensNuevos = realloc(tokens, capacidad*sizeof(char *));
@@ -479,16 +484,34 @@ char **separar_tokens(char *linea){
             tokens = tokensNuevos;
         }
 
-        tokens[cantidad] = token;
-        cantidad++;
+        char *escribe = lee;
+        char comilla = 0;
+        tokens[cantidad++] = escribe;
 
-        token = strtok(NULL, " \t\r\n");
+        while(*lee != '\0'){
+            if(comilla){
+                if(*lee == comilla){ comilla = 0; lee++; }
+                else *escribe++ = *lee++;
+            }
+            else if(*lee == '"' || *lee == '\''){
+                comilla = *lee++;
+            }
+            else if(*lee == ' ' || *lee == '\t' || *lee == '\r' || *lee == '\n'){
+                break;
+            }
+            else{
+                *escribe++ = *lee++;
+            }
+        }
+
+        if(*lee != '\0') lee++; //salta el separador
+        *escribe = '\0';
     }
 
     tokens[cantidad] = NULL;
     return tokens;
-
 }
+
 //se añade la funcion que separa la línea en comandos
 Comando *construir_pipeline(char **tokens, int *n_comandos) {
     int n = 1;
